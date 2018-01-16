@@ -53,12 +53,12 @@ func setup(t *testing.T) {
 
 		bytes, err := ioutil.ReadFile(filepath.Join(sandboxDir, "default_connection.json"))
 		if err != nil {
-			t.Fatal("cannot read MYSQL_SANDBOX_DIR/default_connection.json: %s", err)
+			t.Fatalf("cannot read MYSQL_SANDBOX_DIR/default_connection.json: %s", err)
 		}
 
 		var c connInfo
 		if err := json.Unmarshal(bytes, &c); err != nil {
-			t.Fatal("cannot unmarshal MYSQL_SANDBOX_DIR/default_connection.json: %s", err)
+			t.Fatalf("cannot unmarshal MYSQL_SANDBOX_DIR/default_connection.json: %s", err)
 		}
 
 		defaultPort = c.Port
@@ -97,7 +97,7 @@ func TestNormalFlow(t *testing.T) {
 	}
 	gotStats := pool.Stats()
 	if gotStats.Ts < now {
-		t.Error("got stats.Ts %d, expected >= %d", gotStats.Ts, now)
+		t.Errorf("got stats.Ts %d, expected >= %d", gotStats.Ts, now)
 	}
 	gotStats.Ts = 0
 	if diff := deep.Equal(gotStats, expectStats); diff != nil {
@@ -135,7 +135,7 @@ func TestNormalFlow(t *testing.T) {
 		t.Errorf("got conn error true, expected false")
 	}
 	if err != nil {
-		t.Errorf("got err %s, expected nil")
+		t.Errorf("got err %s, expected nil", err)
 	}
 
 	// Check the stats again
@@ -149,7 +149,7 @@ func TestNormalFlow(t *testing.T) {
 	}
 	gotStats = pool.Stats()
 	if gotStats.Ts < now {
-		t.Error("got stats.Ts %d, expected >= %d", gotStats.Ts, now)
+		t.Errorf("got stats.Ts %d, expected >= %d", gotStats.Ts, now)
 	}
 	gotStats.Ts = 0
 	if diff := deep.Equal(gotStats, expectStats); diff != nil {
@@ -612,7 +612,8 @@ func TestOpenTimeout(t *testing.T) {
 	time.Sleep(200 * time.Millisecond) // yield to goroutine
 
 	// Try to open a 2nd conn with a timeout ctx
-	timeout, _ := context.WithTimeout(context.Background(), time.Duration(500*time.Millisecond))
+	timeout, cancel := context.WithTimeout(context.Background(), time.Duration(500*time.Millisecond))
+	defer cancel()
 	conn, err := pool.Open(timeout)
 	if err == nil {
 		t.Fatalf("got pool.Open error: %v, expected ErrTimeout", err)

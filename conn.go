@@ -20,7 +20,7 @@ var (
 	// MySQL is down, but it could also indicate a network issue. If this error
 	// occurs frequently, verify the network connection and MySQL address. If it
 	// occurs infrequently, it could indicate a transient state that will
-	// recover automatically; for example: a failover. Pool.Error returns true
+	// recover automatically; for example: a failover. Connector.Error returns true
 	// with this error.
 	ErrConnCannotConnect = errors.New("cannot connect")
 
@@ -30,47 +30,80 @@ var (
 	// be lost if it was previously connected. If MySQL is up and ok, this could
 	// indicate a transient state that will recover automatically. If not,
 	// ErrConnCannotConnect will probably be returned next when the driver tries
-	// but fails to reestablish the connection. Pool.Error returns true with this error.
+	// but fails to reestablish the connection. Connector.Error returns true with
+	// this error.
 	ErrConnLost = errors.New("connection lost")
 
 	// ErrQueryKilled is returned when the KILL QUERY command is used. This only
 	// kills the currently active query; the connection is still ok. This error
-	// is not connection-related, so Pool.Error returns false.
+	// is not connection-related, so Connector.Error returns false.
 	ErrQueryKilled = errors.New("query killed")
 
 	// ErrReadOnly is returned when MySQL read-only is enabled. This error is not
-	// connection-related, so Pool.Error returns false.
+	// connection-related, so Connector.Error returns false.
 	ErrReadOnly = errors.New("server is read-only")
 
 	// ErrDupeKey is returned when a unique index prevents a value from being
-	// inserted or updated. This error is not connection-related, so Pool.Error
+	// inserted or updated. This error is not connection-related, so Connector.Error
 	// returns false.
 	ErrDupeKey = errors.New("duplicate key value")
 
 	// ErrTimeout is returned when a context timeout happens. This error is not
-	// connection-related, so Pool.Error returns false.
+	// connection-related, so Connector.Error returns false.
 	ErrTimeout = errors.New("timeout")
 )
 
 type Connector interface {
+	// Open opens a sql.Conn from the pool. It returns the error from sql.Conn,
+	// if any. The caller should pass the error to Error to return a high-level
+	// error exported by this package.
 	Open(context.Context) (*sql.Conn, error)
-	Close(*sql.Conn)
+
+	// Close closes a sql.Conn by calling its Close method. The caller should call
+	// this method instead of calling conn.Close directly. Do not call both, but
+	// one or the other must be called to return the connection to the pool. It
+	// returns the error from conn.Close, if any.
+	Close(*sql.Conn) error
+
+	// Error returns true if the given error indicates the connection was lost,
+	// else it returns false. If true, the caller should wait and retry the
+	// operation. The driver will attempt to reconnect, but it usually takes
+	// one or two attempts after the first error before the driver reestablishes
+	// the connection. This is a driver implementation detail that cannot be
+	// changed by the caller.
+	//
+	// The returned error can be different than the given error. Certain low-level
+	// MySQL errors are returned as high-level errors exported by this package,
+	// like ErrQueryKilled and ErrReadOnly. These high-level errors are common
+	// and usually require special handling or retries by the caller. The caller
+	// should check for and handle these high-level errors. Other errors are
+	// probably not recoverable and should be logged and reported as an internal
+	// error or bug.
+	//
+	// If the given error is not a MySQL error or nil, the method does nothing
+	// and returns false and the given error.
+	//
+	// The caller should always call this method with any error from any code
+	// that used a sql.Conn. See packages docs for the canonical workflow.
 	Error(error) (bool, error)
-	Stats() Stats
 }
 
+// Stats represents counters and gauges for connection-related events. A Pool
+// saves and exposes stats.
 type Stats struct {
 	*sync.Mutex
-	Ts        int64
-	Open      int  // sql.DBStats.OpenConnections, not always accurate (gauge)
-	OpenCalls int  // All calls to Open (counter)
-	Opened    uint // Successful calls to Open (counter)
-	Closed    uint // All calls to close (counter)
-	Timeout   uint // Timeouts during calls to Open (counter)
-	Lost      uint // Lost connections (counter)
-	Down      uint // ErrConnCannotConnect errors (counter)
+	Ts        int64 // Unix timestamp when stats were returned
+	Open      int   // sql.DBStats.OpenConnections, not always accurate (gauge)
+	OpenCalls int   // All calls to Open (counter)
+	Opened    uint  // Successful calls to Open (counter)
+	Closed    uint  // All calls to close (counter)
+	Timeout   uint  // Timeouts during calls to Open (counter)
+	Lost      uint  // Lost connections (counter)
+	Down      uint  // ErrConnCannotConnect errors (counter)
 }
 
+// Pool represents a MySQL connection pool. It implements the Connector interface
+// and exposes Stats.
 type Pool struct {
 	db    *sql.DB
 	stats *Stats
@@ -86,8 +119,7 @@ func NewPool(db *sql.DB) *Pool {
 	}
 }
 
-// Open opens a sql.Conn from the pool. The caller should always call this
-// function to open a connection because it saves stats.
+// Open opens a database connection. See Connector.Open for more details.
 func (p *Pool) Open(ctx context.Context) (*sql.Conn, error) {
 	p.stats.Lock()
 	p.stats.OpenCalls++
@@ -105,30 +137,20 @@ func (p *Pool) Open(ctx context.Context) (*sql.Conn, error) {
 	return conn, err
 }
 
-// Close closes a sql.Conn obtained from the pool by calling Open. The caller
-// should always call this function to close the sql.Conn because it saves stats.
-func (p *Pool) Close(conn *sql.Conn) {
-	conn.Close()
+// Close closes a database connection. See Connector.Close for more details.
+func (p *Pool) Close(conn *sql.Conn) error {
+	err := conn.Close()
 
 	p.stats.Lock()
 	p.stats.Closed++
 	p.stats.Unlock()
+
+	return err
 }
 
-// Error returns true if the given error is a connection error (ErrConn*), else
-// it returns false. If true, the caller should wait and retry the operation;
-// the driver will attempt to reconnect. However, it usually take one or two
-// attempts after the first error before the driver reestablishes the connection.
-// This is a driver implementation detail that cannot be changed by the caller.
-// If false, the returned error could be one provided by this package, like
-// ErrReadOnly. The caller should check and handle accordingly.
-//
-// If the given error is not a MySQL error or nil, it returns false and the given
-// error.
-//
-// The caller should always call this function on error from any code that uses
-// a sql.Conn obtained from the pool because it saves stats based on the error.
-// See packages docs for the correct, typical workflow.
+// Error determine if the given error is connection-related and possibly
+// transforms it into a higher-level error exported by this package. See
+// Connector.Error for more details.
 func (p *Pool) Error(err error) (bool, error) {
 	if err == nil {
 		return false, nil
@@ -171,6 +193,9 @@ func (p *Pool) Error(err error) (bool, error) {
 // Stats returns the stats since the last call to Stats. Stats are never
 // reset. The Open stat is not always accurate. The driver updates it lazily,
 // so it can be higher than the actual number of currently open connections.
+//
+// The caller is expected to poll Stats at regular intervals. It is safe to
+// safe to call concurrently.
 func (p *Pool) Stats() Stats {
 	// Set ts and copy stats
 	p.stats.Lock()
@@ -226,6 +251,8 @@ func Down(err error) bool {
 	return ok
 }
 
+// MySQLErrorCode returns the MySQL server error code for the error, or zero
+// if the error is not a MySQL error.
 func MySQLErrorCode(err error) uint16 {
 	if val, ok := err.(*mysql.MySQLError); ok {
 		return val.Number
